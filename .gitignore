@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.task
+frame_analysis/
+tests/*.png
+tests/*.gif
+.gemini/
