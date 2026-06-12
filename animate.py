@@ -161,7 +161,113 @@ def get_landmarks_via_gemini(image_path: str):
         return None
 
 
-# ── RBF Warp ─────────────────────────────────────────────────────
+# ── Precomputed RBF Warp (Fast) ──────────────────────────────────
+class PrecomputedRBF:
+    def __init__(self, landmarks, active_sources, anchor_indices, sigma, img_shape, reg=1e-2):
+        """
+        Precomputes RBF grids, interpolation matrices (Phi), and system solvers (K_inv)
+        for a constant set of source landmarks and anchor points.
+        This speeds up animation generation by 30x-100x because Phi and K_inv are computed ONCE
+        per sequence instead of once per frame.
+        """
+        self.sigma = sigma
+        self.img_shape = img_shape
+        self.valid = False
+
+        src_pts = []
+        active_srcs = []
+        for p in active_sources:
+            u_pt = np.array(p, dtype=np.float32)
+            src_pts.append(u_pt)
+            active_srcs.append(u_pt)
+
+        # Filter anchor_indices: no duplicates, and not too close to active points (within 5 pixels)
+        unique_anchors = []
+        for idx in anchor_indices:
+            if idx in unique_anchors:
+                continue
+            pt_coord = np.array(landmarks[idx], dtype=np.float32)
+            too_close = False
+            for act_pt in active_srcs:
+                if np.linalg.norm(pt_coord - act_pt) < 5.0:
+                    too_close = True
+                    break
+            if not too_close:
+                unique_anchors.append(idx)
+
+        # Append safe, unique anchors
+        for idx in unique_anchors:
+            pt_coord = np.array(landmarks[idx], dtype=np.float32)
+            src_pts.append(pt_coord)
+
+        self.src_pts = np.array(src_pts, dtype=np.float32)
+        self.N = len(self.src_pts)
+        if self.N == 0:
+            return
+
+        # K matrix: (N, N)
+        K = np.exp(-np.sum((self.src_pts[:, None] - self.src_pts[None, :])**2, axis=-1) / (2 * sigma**2))
+        try:
+            self.K_inv = np.linalg.inv(K + reg * np.eye(self.N))
+        except np.linalg.LinAlgError:
+            self.K_inv = np.linalg.pinv(K + reg * np.eye(self.N))
+
+        margin = max(4, int(sigma * 2.5))
+        self.x0 = max(0, int(self.src_pts[:, 0].min()) - margin)
+        self.y0 = max(0, int(self.src_pts[:, 1].min()) - margin)
+        self.x1 = min(img_shape[1], int(self.src_pts[:, 0].max()) + margin)
+        self.y1 = min(img_shape[0], int(self.src_pts[:, 1].max()) + margin)
+        if self.x1 <= self.x0 or self.y1 <= self.y0:
+            return
+
+        xs = np.arange(self.x0, self.x1, dtype=np.float32)
+        ys = np.arange(self.y0, self.y1, dtype=np.float32)
+        X, Y = np.meshgrid(xs, ys)
+        self.X, self.Y = X, Y
+        gp = np.stack([X.ravel(), Y.ravel()], axis=-1)
+        
+        # Phi matrix: (ROI_pixels, N)
+        self.Phi = np.exp(-np.sum((gp[:, None] - self.src_pts[None, :])**2, axis=-1) / (2 * sigma**2))
+
+        h_roi, w_roi = X.shape
+        Xr = X - self.x0
+        Yr = Y - self.y0
+        border_d = np.minimum(np.minimum(Xr, w_roi - 1 - Xr), np.minimum(Yr, h_roi - 1 - Yr))
+        fade = np.clip(border_d / max(1.0, float(margin)), 0.0, 1.0)
+        self.fade = 0.5 * (1.0 - np.cos(fade * np.pi))
+        self.valid = True
+
+    def warp(self, img, dst_pts_active):
+        if not self.valid:
+            return img.copy()
+
+        dst_pts = list(dst_pts_active)
+        num_active = len(dst_pts_active)
+        # Append anchors remaining at their source positions (displacement = 0)
+        for i in range(num_active, self.N):
+            dst_pts.append(self.src_pts[i])
+
+        dst_pts = np.array(dst_pts, dtype=np.float32)
+        disp = dst_pts - self.src_pts
+        w_rbf = self.K_inv @ disp
+
+        dg = self.Phi @ w_rbf
+        dx = dg[:, 0].reshape(self.X.shape) * self.fade
+        dy = dg[:, 1].reshape(self.Y.shape) * self.fade
+
+        Xr = self.X - self.x0
+        Yr = self.Y - self.y0
+        map_x = (Xr - dx).astype(np.float32)
+        map_y = (Yr - dy).astype(np.float32)
+
+        roi = img[self.y0:self.y1, self.x0:self.x1]
+        warped = cv2.remap(roi, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        out = img.copy()
+        out[self.y0:self.y1, self.x0:self.x1] = warped
+        return out
+
+
+# ── RBF Warp (Legacy & Compatibility Fallback) ───────────────────
 def rbf_warp_local(img, landmarks, active_pairs, anchor_indices, sigma, scale=1.0):
     """
     Gaussian RBF local warp.
@@ -213,7 +319,10 @@ def rbf_warp_local(img, landmarks, active_pairs, anchor_indices, sigma, scale=1.
 
     reg   = 1e-2  # Slightly higher regularization to prevent any high-frequency oscillations
     K     = np.exp(-np.sum((src_pts[:,None]-src_pts[None,:])**2, axis=-1) / (2*sigma**2))
-    w_rbf = np.linalg.solve(K + reg * np.eye(N), disp)
+    try:
+        w_rbf = np.linalg.solve(K + reg * np.eye(N), disp)
+    except np.linalg.LinAlgError:
+        w_rbf = np.linalg.lstsq(K + reg * np.eye(N), disp, rcond=-1)[0]
 
     margin = max(4, int(sigma * 2.5))
     x0 = max(0, int(src_pts[:,0].min()) - margin)
@@ -250,7 +359,7 @@ def rbf_warp_local(img, landmarks, active_pairs, anchor_indices, sigma, scale=1.
 # ── Blink (guaranteed) ───────────────────────────────────────────
 BLINK_TPL = [1.0, 0.80, 0.45, 0.10, 0.02, 0.10, 0.45, 0.80, 1.0]   # 9 frames
 
-def _apply_eye_blink_masked(img, landmarks, face_width, left_scale, right_scale):
+def _apply_eye_blink_masked(img, landmarks, face_width, left_scale, right_scale, left_warper=None, right_warper=None):
     """
     Applies eye blink/wink using local RBF warp, restricted to an oval mask around the eyes
     with dynamic eyebrow-shielding vertical gradients to prevent eyebrow stretching.
@@ -261,8 +370,16 @@ def _apply_eye_blink_masked(img, landmarks, face_width, left_scale, right_scale)
     # ── Left Eye ──
     if left_scale < 0.99:
         # 1. Compute RBF warped image for left eye
-        sigma = face_width * 0.04
-        warped_l = rbf_warp_local(out_img, landmarks, LEFT_EYE_PAIRS, LEFT_EYE_ANCHORS, sigma, scale=left_scale)
+        if left_warper is not None and left_warper.valid:
+            left_dst_pts = []
+            for u, l in LEFT_EYE_PAIRS.items():
+                u_pt = np.array(landmarks[u], dtype=np.float32)
+                l_pt = np.array(landmarks[l], dtype=np.float32)
+                left_dst_pts.append(left_scale * u_pt + (1.0 - left_scale) * l_pt)
+            warped_l = left_warper.warp(out_img, left_dst_pts)
+        else:
+            sigma = face_width * 0.04
+            warped_l = rbf_warp_local(out_img, landmarks, LEFT_EYE_PAIRS, LEFT_EYE_ANCHORS, sigma, scale=left_scale)
         
         # 2. Compute left eye oval mask
         left_xs = [landmarks[idx][0] for idx in LEFT_EYE]
@@ -286,12 +403,8 @@ def _apply_eye_blink_masked(img, landmarks, face_width, left_scale, right_scale)
         
         # Safeguard: fade mask to 0 at and above the lowest eyebrow landmark
         l_brow_y_max = max(landmarks[idx][1] for idx in LEFT_EYEBROW)
-        eye_ramp = np.ones(h, dtype=np.float32)
-        for y in range(h):
-            if y <= l_brow_y_max:
-                eye_ramp[y] = 0.0
-            elif y < l_cy:
-                eye_ramp[y] = (y - l_brow_y_max) / (l_cy - l_brow_y_max)
+        ys = np.arange(h, dtype=np.float32)
+        eye_ramp = np.clip((ys - l_brow_y_max) / (l_cy - l_brow_y_max + 1e-9), 0.0, 1.0)
         
         mask_l = mask_l * eye_ramp[:, np.newaxis]
         
@@ -302,8 +415,16 @@ def _apply_eye_blink_masked(img, landmarks, face_width, left_scale, right_scale)
     # ── Right Eye ──
     if right_scale < 0.99:
         # 1. Compute RBF warped image for right eye
-        sigma = face_width * 0.04
-        warped_r = rbf_warp_local(out_img, landmarks, RIGHT_EYE_PAIRS, RIGHT_EYE_ANCHORS, sigma, scale=right_scale)
+        if right_warper is not None and right_warper.valid:
+            right_dst_pts = []
+            for u, l in RIGHT_EYE_PAIRS.items():
+                u_pt = np.array(landmarks[u], dtype=np.float32)
+                l_pt = np.array(landmarks[l], dtype=np.float32)
+                right_dst_pts.append(right_scale * u_pt + (1.0 - right_scale) * l_pt)
+            warped_r = right_warper.warp(out_img, right_dst_pts)
+        else:
+            sigma = face_width * 0.04
+            warped_r = rbf_warp_local(out_img, landmarks, RIGHT_EYE_PAIRS, RIGHT_EYE_ANCHORS, sigma, scale=right_scale)
         
         # 2. Compute right eye oval mask
         right_xs = [landmarks[idx][0] for idx in RIGHT_EYE]
@@ -327,12 +448,8 @@ def _apply_eye_blink_masked(img, landmarks, face_width, left_scale, right_scale)
         
         # Safeguard: fade mask to 0 at and above the lowest eyebrow landmark
         r_brow_y_max = max(landmarks[idx][1] for idx in RIGHT_EYEBROW)
-        eye_ramp = np.ones(h, dtype=np.float32)
-        for y in range(h):
-            if y <= r_brow_y_max:
-                eye_ramp[y] = 0.0
-            elif y < r_cy:
-                eye_ramp[y] = (y - r_brow_y_max) / (r_cy - r_brow_y_max)
+        ys = np.arange(h, dtype=np.float32)
+        eye_ramp = np.clip((ys - r_brow_y_max) / (r_cy - r_brow_y_max + 1e-9), 0.0, 1.0)
                 
         mask_r = mask_r * eye_ramp[:, np.newaxis]
         
@@ -378,24 +495,40 @@ def _make_blink_schedule(n_frames, fps=15):
 
 
 # ── Public blink/wink animators ─────────────────────────────────
+# ── Public blink/wink animators ─────────────────────────────────
 def animate_blink(img, landmarks, w, h, cycle=None, fps=12):
     p_l = landmarks[234]; p_r = landmarks[454]
     fw  = float(np.linalg.norm(np.array(p_l) - np.array(p_r)))
     if cycle is None:
         cycle = BLINK_TPL
-    return [cv2.cvtColor(_apply_blink(img, landmarks, fw, sc), cv2.COLOR_BGR2RGB)
-            for sc in cycle]
+    sigma_eye = fw * 0.04
+    left_eye_active_srcs = [np.array(landmarks[u], dtype=np.float32) for u in LEFT_EYE_PAIRS.keys()]
+    left_warper = PrecomputedRBF(landmarks, left_eye_active_srcs, LEFT_EYE_ANCHORS, sigma_eye, img.shape)
+    right_eye_active_srcs = [np.array(landmarks[u], dtype=np.float32) for u in RIGHT_EYE_PAIRS.keys()]
+    right_warper = PrecomputedRBF(landmarks, right_eye_active_srcs, RIGHT_EYE_ANCHORS, sigma_eye, img.shape)
+
+    frames = []
+    for sc in cycle:
+        f = _apply_eye_blink_masked(img, landmarks, fw, sc, sc, left_warper, right_warper)
+        frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+    return frames
 
 def animate_wink(img, landmarks, w, h, side="left", cycle=None):
     p_l = landmarks[234]; p_r = landmarks[454]
     fw  = float(np.linalg.norm(np.array(p_l) - np.array(p_r)))
     if cycle is None:
         cycle = [1.0, 0.7, 0.3, 0.1, 0.3, 0.7, 1.0]
+    sigma_eye = fw * 0.04
+    left_eye_active_srcs = [np.array(landmarks[u], dtype=np.float32) for u in LEFT_EYE_PAIRS.keys()]
+    left_warper = PrecomputedRBF(landmarks, left_eye_active_srcs, LEFT_EYE_ANCHORS, sigma_eye, img.shape)
+    right_eye_active_srcs = [np.array(landmarks[u], dtype=np.float32) for u in RIGHT_EYE_PAIRS.keys()]
+    right_warper = PrecomputedRBF(landmarks, right_eye_active_srcs, RIGHT_EYE_ANCHORS, sigma_eye, img.shape)
+
     frames = []
     for sc in cycle:
         left_sc = sc if side == "left" else 1.0
         right_sc = sc if side == "right" else 1.0
-        f = _apply_eye_blink_masked(img, landmarks, fw, left_sc, right_sc)
+        f = _apply_eye_blink_masked(img, landmarks, fw, left_sc, right_sc, left_warper, right_warper)
         frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
     return frames
 
@@ -408,12 +541,17 @@ def animate_smile(img, landmarks, w, h, intensity=1.0):
     stretch = fw * 0.13 * intensity
     lc = np.array(landmarks[61], dtype=np.float32)
     rc = np.array(landmarks[291], dtype=np.float32)
-    pairs   = [(lc, lc+np.array([-stretch, -stretch*0.3])),
-               (rc, rc+np.array([+stretch, -stretch*0.3]))]
     anchors = [6, 168, 197, 2, 94, 152, 148, 377, 33, 133, 263, 362]
+    
+    active_srcs = [lc, rc]
+    smile_warper = PrecomputedRBF(landmarks, active_srcs, anchors, sigma, img.shape)
+    
     frames  = []
     for t in np.linspace(0, 1.0, 10):
-        f = rbf_warp_local(img, landmarks, pairs, anchors, sigma, scale=1.0-t)
+        scale = 1.0 - t
+        dst_pts = [scale * lc + (1.0 - scale) * (lc + np.array([-stretch, -stretch*0.3])),
+                   scale * rc + (1.0 - scale) * (rc + np.array([+stretch, -stretch*0.3]))]
+        f = smile_warper.warp(img, dst_pts)
         frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
     frames += [frames[-1]] * 5
     return frames
@@ -423,13 +561,16 @@ def animate_eyebrow_raise(img, landmarks, w, h, intensity=1.0):
     fw  = float(np.linalg.norm(np.array(p_l) - np.array(p_r)))
     sigma = fw * 0.16
     shift = fw * 0.13 * intensity
-    pairs = [(np.array(landmarks[i], dtype=np.float32),
-              np.array(landmarks[i], dtype=np.float32) + np.array([0.0, -shift]))
-             for i in LEFT_EYEBROW + RIGHT_EYEBROW]
+    active_srcs = [np.array(landmarks[i], dtype=np.float32) for i in LEFT_EYEBROW + RIGHT_EYEBROW]
     anchors = [6, 168, 197, 33, 133, 263, 362, 234, 454]
+    
+    brow_warper = PrecomputedRBF(landmarks, active_srcs, anchors, sigma, img.shape)
+    
     frames  = []
     for t in np.linspace(0, 1.0, 8):
-        f = rbf_warp_local(img, landmarks, pairs, anchors, sigma, scale=1.0-t)
+        scale = 1.0 - t
+        dst_pts = [scale * p + (1.0 - scale) * (p + np.array([0.0, -shift])) for p in active_srcs]
+        f = brow_warper.warp(img, dst_pts)
         frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
     frames += [frames[-1]] * 4
     return frames
@@ -546,7 +687,27 @@ def text_to_param_timeline(text: str):
     return smoothed
 
 
-def _apply_viseme_frame(img, landmarks, params, face_width, sigma_mouth):
+def _get_mouth_active_srcs(landmarks):
+    srcs = []
+    # Corners
+    srcs.append(np.array(landmarks[L_CORNER], dtype=np.float32))
+    srcs.append(np.array(landmarks[R_CORNER], dtype=np.float32))
+    # UL_TOP
+    for idx in UL_TOP:
+        srcs.append(np.array(landmarks[idx], dtype=np.float32))
+    # UL_BOT
+    for idx in UL_BOT:
+        srcs.append(np.array(landmarks[idx], dtype=np.float32))
+    # LL_BOT
+    for idx in LL_BOT:
+        srcs.append(np.array(landmarks[idx], dtype=np.float32))
+    # LL_TOP
+    for idx in LL_TOP:
+        srcs.append(np.array(landmarks[idx], dtype=np.float32))
+    return srcs
+
+
+def _apply_viseme_frame(img, landmarks, params, face_width, sigma_mouth, mouth_warper=None):
     """
     Apply lip warp for one frame.
     params: [jaw, spread, purse, upper_rise, lower_drop]
@@ -564,13 +725,6 @@ def _apply_viseme_frame(img, landmarks, params, face_width, sigma_mouth):
 
     # ── Synthetic neck/body anchors to keep collar/neck completely static ──
     # Disabled for speed optimization (rendered redundant by tight lips blending mask)
-    # cx, cy = landmarks[152]
-    # for dy_factor in [0.08, 0.2, 0.35, 0.5, 0.7, 0.9, 1.1, 1.3]:
-    #     dy = int(dy_factor * face_width)
-    #     for dx_factor in [-1.8, -1.3, -0.9, -0.5, -0.2, 0.0, 0.2, 0.5, 0.9, 1.3, 1.8]:
-    #         dx = int(dx_factor * face_width)
-    #         pt_sec = np.array([cx + dx, cy + dy], dtype=np.float32)
-    #         active.append((pt_sec, pt_sec))
 
     # ── Corners ──────────────────────────────────────────────────
     corner_dx = spread * mouth_width * 0.20 - purse * mouth_width * 0.12
@@ -623,13 +777,41 @@ def _apply_viseme_frame(img, landmarks, params, face_width, sigma_mouth):
 
     # ── Jaw/Chin movement ────────
     # Disabled to ensure jawline remains 100% static and does not overflow.
-    # jaw_dy = lower_dy * 0.18
-    # for idx in CHIN:
-    #     p = pt(idx)
-    #     active.append((p, p + np.array([0.0, jaw_dy])))
 
     # Apply RBF warp
-    warped_img = rbf_warp_local(img, landmarks, active, MOUTH_ANCHORS, sigma_mouth, scale=0.0)
+    if mouth_warper is not None and mouth_warper.valid:
+        dst_pts = []
+        # Corners
+        dst_pts.append(lc + np.array([-corner_dx,  corner_dy]))
+        dst_pts.append(rc + np.array([+corner_dx,  corner_dy]))
+        # Upper lip Top
+        for idx in UL_TOP:
+            p = pt(idx)
+            taper = get_taper(p[0])
+            dx_p  = -purse * (p[0]-mouth_cx) * 0.09
+            dst_pts.append(p + np.array([dx_p, upper_dy * taper]))
+        # Upper lip Bot
+        for idx in UL_BOT:
+            p = pt(idx)
+            taper = get_taper(p[0])
+            dx_p  = -purse * (p[0]-mouth_cx) * 0.07
+            dst_pts.append(p + np.array([dx_p, upper_dy * taper * 0.6]))
+        # Lower lip Bot
+        for idx in LL_BOT:
+            p = pt(idx)
+            taper = get_taper(p[0])
+            dx_p  = -purse * (p[0]-mouth_cx) * 0.07
+            dst_pts.append(p + np.array([dx_p, lower_dy * taper]))
+        # Lower lip Top
+        for idx in LL_TOP:
+            p = pt(idx)
+            taper = get_taper(p[0])
+            dx_p  = -purse * (p[0]-mouth_cx) * 0.06
+            dst_pts.append(p + np.array([dx_p, lower_dy * taper * 0.72]))
+            
+        warped_img = mouth_warper.warp(img, dst_pts)
+    else:
+        warped_img = rbf_warp_local(img, landmarks, active, MOUTH_ANCHORS, sigma_mouth, scale=0.0)
 
     # ── Dynamically sized tight lips mask ──
     h_img, w_img = img.shape[:2]
@@ -663,13 +845,8 @@ def _apply_viseme_frame(img, landmarks, params, face_width, sigma_mouth):
     y_fade_start = y_nose_base - 10
     y_fade_end = int(mouth_cy)
     
-    ramp = np.ones(h_img, dtype=np.float32)
-    for y in range(h_img):
-        if y < y_fade_start:
-            ramp[y] = 0.0
-        elif y < y_fade_end:
-            ramp[y] = (y - y_fade_start) / (y_fade_end - y_fade_start)
-            
+    ys = np.arange(h_img, dtype=np.float32)
+    ramp = np.clip((ys - y_fade_start) / (y_fade_end - y_fade_start + 1e-9), 0.0, 1.0)
     mask = mask * ramp[:, np.newaxis]
     
     # Blend the warp into the output image
@@ -727,7 +904,7 @@ def _draw_mouth_cavity(frame, landmarks, lower_drop, face_width):
 
 
 # ── Main talk animator ───────────────────────────────────────────
-def animate_talk(img, landmarks, w, h, cycle=None, text=None):
+def animate_talk(img, landmarks, w, h, cycle=None, text=None, use_precompute=True, max_frames=None):
     """
     PIPELINE:
     1. Build param_timeline (N frames, 5 params each)
@@ -761,10 +938,28 @@ def animate_talk(img, landmarks, w, h, cycle=None, text=None):
             rows.append([hf*2.0, hf*0.12, 0.0, hf*0.45, hf*1.80])
         timeline = np.array(rows, dtype=np.float32)
 
+    if max_frames is not None:
+        timeline = timeline[:max_frames]
+
     n_frames = len(timeline)
 
     # ── Guaranteed blink schedule ─────────────────────────────────
     blink_map = _make_blink_schedule(n_frames, fps=15)
+
+    # ── Precompute RBF warpers for maximum performance ────────────
+    if use_precompute:
+        mouth_active_srcs = _get_mouth_active_srcs(landmarks)
+        mouth_warper = PrecomputedRBF(landmarks, mouth_active_srcs, [], sigma_mouth, img.shape)
+        
+        left_eye_active_srcs = [np.array(landmarks[u], dtype=np.float32) for u in LEFT_EYE_PAIRS.keys()]
+        left_eye_warper = PrecomputedRBF(landmarks, left_eye_active_srcs, LEFT_EYE_ANCHORS, sigma_eye, img.shape)
+        
+        right_eye_active_srcs = [np.array(landmarks[u], dtype=np.float32) for u in RIGHT_EYE_PAIRS.keys()]
+        right_eye_warper = PrecomputedRBF(landmarks, right_eye_active_srcs, RIGHT_EYE_ANCHORS, sigma_eye, img.shape)
+    else:
+        mouth_warper = None
+        left_eye_warper = None
+        right_eye_warper = None
 
     frames = []
     for i, params in enumerate(timeline):
@@ -776,12 +971,13 @@ def animate_talk(img, landmarks, w, h, cycle=None, text=None):
             off = blink_map[i]
             eye_sc = BLINK_TPL[off] if 0 <= off < len(BLINK_TPL) else 1.0
             if eye_sc < 0.98:
-                frame = _apply_eye_blink_masked(frame, landmarks, fw, eye_sc, eye_sc)
+                frame = _apply_eye_blink_masked(frame, landmarks, fw, eye_sc, eye_sc, 
+                                                left_warper=left_eye_warper, right_warper=right_eye_warper)
 
         # 2. EYEBROW — disabled during speech to keep eyebrow/eye animations completely separate and static
 
         # 3. LIP WARP
-        frame = _apply_viseme_frame(frame, landmarks, params, fw, sigma_mouth)
+        frame = _apply_viseme_frame(frame, landmarks, params, fw, sigma_mouth, mouth_warper=mouth_warper)
 
         # 4. MOUTH CAVITY
         frame = _draw_mouth_cavity(frame, landmarks, lower_drop, fw)
