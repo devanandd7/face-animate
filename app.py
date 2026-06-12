@@ -27,7 +27,7 @@ import imageio, numpy as np, cv2
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDJwfTmehVJWYpefIa_mAsR5tTUjMTcQ-A")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 BLINK_CYCLE  = [1.0, 0.85, 0.6, 0.3, 0.08, 0.3, 0.6, 0.85, 1.0]
 TALK_CYCLE   = [1.0, 0.7, 0.5, 0.8, 0.4, 0.6, 0.3, 0.7, 0.5, 1.0, 0.6, 0.3, 0.6, 0.8, 1.0]
