@@ -51,6 +51,7 @@ HTML = r"""<!DOCTYPE html>
 <title>AI Face Animator — Lifelike Expression Engine</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js" crossorigin="anonymous"></script>
 <style>
 /* ── Reset & base ─────────────────────────────────────────────── */
 *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
@@ -445,6 +446,36 @@ select {
 
 <script>
 let resultBlob = null;
+let faceLandmarker = null;
+let detectedLandmarks = null;
+let landmarkError = null;
+
+async function initFaceLandmarker() {
+  try {
+    const FilesetResolver = window.FilesetResolver || (window.vision && window.vision.FilesetResolver);
+    const FaceLandmarker = window.FaceLandmarker || (window.vision && window.vision.FaceLandmarker);
+    if (!FilesetResolver || !FaceLandmarker) {
+      console.warn("MediaPipe library not loaded yet.");
+      return;
+    }
+    const filesetResolver = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU"
+      },
+      outputFaceBlendshapes: false,
+      outputFacialTransformationMatrixes: false,
+      runningMode: "IMAGE",
+      numFaces: 1
+    });
+    console.log("Client-side MediaPipe FaceLandmarker initialized.");
+  } catch (err) {
+    console.error("Failed to load client-side FaceLandmarker:", err);
+  }
+}
 let loaderHints = [
   "Detecting face landmarks…",
   "Running RBF warp engine…",
@@ -458,6 +489,41 @@ let hintIdx = 0, hintTimer = null;
 const imageInput = document.getElementById('imageInput');
 const uploadZone = document.getElementById('uploadZone');
 const thumb      = document.getElementById('uploadThumb');
+
+thumb.onload = async () => {
+  detectedLandmarks = null;
+  landmarkError = null;
+  
+  if (!faceLandmarker) {
+    setStatus("Initializing face detector in your browser...", "info");
+    await initFaceLandmarker();
+  }
+  
+  if (!faceLandmarker) {
+    setStatus("⚠️ Could not load face detector. Server fallback will be used.", "info");
+    landmarkError = "FaceLandmarker not initialized";
+    return;
+  }
+  
+  setStatus("Detecting face landmarks in browser...", "info");
+  try {
+    const result = faceLandmarker.detect(thumb);
+    if (result && result.faceLandmarks && result.faceLandmarks.length > 0) {
+      const w = thumb.naturalWidth;
+      const h = thumb.naturalHeight;
+      const pts = result.faceLandmarks[0];
+      detectedLandmarks = pts.map(p => [Math.round(p.x * w), Math.round(p.y * h)]);
+      setStatus(`✅ Face detected! Ready to animate.`, "ok");
+    } else {
+      setStatus("⚠️ No face detected. Try a clear front-facing photo.", "err");
+      landmarkError = "No face detected in browser";
+    }
+  } catch (err) {
+    console.error("Landmark detection error:", err);
+    setStatus("⚠️ Face detection failed in browser.", "err");
+    landmarkError = err.message;
+  }
+};
 
 imageInput.addEventListener('change', e => {
   const file = e.target.files[0];
@@ -533,6 +599,12 @@ async function runAnimate() {
   formData.append('text',      aiText || (speechText ? '' : ''));
   formData.append('speech',    speechText);
   formData.append('api_key',   apiKey);
+  
+  if (detectedLandmarks) {
+    formData.append('landmarks', JSON.stringify(detectedLandmarks));
+  } else {
+    console.warn("No client-side landmarks detected. Falling back to server-side detection.");
+  }
 
   // UI: loading state
   document.getElementById('animateBtn').disabled = true;
@@ -649,8 +721,37 @@ def animate():
             file.save(tmp.name)
             tmp_path = tmp.name
 
-        # Detect landmarks
-        img, (w, h), landmarks = get_landmarks(tmp_path)
+        # Detect landmarks (accept client-side detection to bypass MediaPipe on server)
+        landmarks_json = request.form.get("landmarks")
+        img = None
+        landmarks = None
+        w, h = 0, 0
+
+        if landmarks_json:
+            try:
+                import json
+                raw_lms = json.loads(landmarks_json)
+                landmarks = [(int(pt[0]), int(pt[1])) for pt in raw_lms]
+                img = cv2.imread(tmp_path)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    # Scale landmarks if image needs downscaling
+                    max_dim = 1024
+                    if max(h, w) > max_dim:
+                        scale = max_dim / max(h, w)
+                        new_w = int(w * scale)
+                        new_h = int(h * scale)
+                        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        landmarks = [(int(x * scale), int(y * scale)) for (x, y) in landmarks]
+                        w, h = new_w, new_h
+            except Exception as e:
+                print(f"[Client Landmarks] Error parsing landmarks: {e}")
+                landmarks = None
+
+        if landmarks is None:
+            # Fallback to server-side MediaPipe landmarker
+            img, (w, h), landmarks = get_landmarks(tmp_path)
+
         if landmarks is None:
             os.unlink(tmp_path)
             return jsonify({"error": "No face detected. Try a clear front-facing photo."}), 400

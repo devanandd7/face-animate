@@ -10,10 +10,14 @@ v4 FIXES (frame analysis revealed):
 """
 
 import cv2
-import mediapipe as mp
-from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.core import base_options as mp_base_options
 import numpy as np
+try:
+    import mediapipe as mp
+    from mediapipe.tasks.python import vision
+    from mediapipe.tasks.python.core import base_options as mp_base_options
+    _MEDIAPIPE_OK = True
+except ImportError:
+    _MEDIAPIPE_OK = False
 import imageio
 from PIL import Image
 import json
@@ -113,6 +117,10 @@ def get_landmarks(image_path: str):
         # Write back to image_path so MediaPipe reads the resized image
         cv2.imwrite(image_path, img)
         h, w = img.shape[:2]
+
+    if not _MEDIAPIPE_OK:
+        print("[MediaPipe] Not installed on backend. Landmarks must be provided by client.")
+        return None, None, None
 
     if not os.path.exists(MODEL_PATH):
         print(f"[MediaPipe] Model not found: {MODEL_PATH}")
